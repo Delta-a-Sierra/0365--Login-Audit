@@ -1,29 +1,20 @@
 param(
-
     [int]$days = 7, #Days worth of logs
     [string]$singleCompany = $False, # $True when running against only one company
     [string]$logPath = "$PSScriptRoot\Logs\GatherData-Log - $(Get-Date -Format dd-MM-yy).txt",
     [string]$dataPath = "$PSScriptRoot\Raw Data\auditdata-$(Get-Date -Format dd-MM-yy)-logins.csv"
 )
 
+
 function write-log {param([string]$message)
     Write-host "`n$(get-date): $message" 
     Write-Output "$(get-date): $message" | Out-File -FilePath $logPath -Append
       
-  }
+}
 
-################################## Configuration Section ##################################
-# Accounts file
+
 $accounts = import-csv -path "$PSScriptRoot\Accounts.csv"
-
-#retries and timeout
-$retryMax = 3
-$retrySleepMinutes = 2
-
-
 $auditData = @()
-
-####################################### Section End #######################################
 
 if ($singleCompany -eq $true) {
     $companies = $accounts | ForEach-Object { $_.name }
@@ -41,30 +32,25 @@ if ($singleCompany -eq $true) {
 }
 
 $accounts | ForEach-Object {
-    $auditingEnabled = $true
     $companyName = $_.name
     write-log -message "############## $companyName ##############"
 
     $cred = New-Object System.Management.Automation.PSCredential `
         -ArgumentList $_.email, $(ConvertTo-SecureString $_.password)
- 
     $session = New-PSSession -ConfigurationName Microsoft.Exchange `
         -ConnectionUri https://outlook.office365.com/powershell-liveid/ `
         -Credential $cred -Authentication Basic -AllowRedirection    
     Import-PSSession $session 
-
-    
 
     $AuditLogEnabled = (Get-AdminAuditLogConfig).UnifiedAuditLogIngestionEnabled 
     if ($AuditLogEnabled -ne $true) {
         Enable-OrganizationCustomization 
         write-log -message "Attempting to enable auditing" 
         try { Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled $true -erroraction stop }
-        catch { write-log -message "Enabling Auditing failed" } 
-        $auditingEnabled = $False
+        catch { write-log -message "Enabling Auditing failed error" } 
     }
     
-    if($auditingEnabled -eq $true){
+    if($AuditLogEnabled -eq $true){
         $LogSearchParams = @{
             enddate        = $(get-date)
             StartDate      = $((get-date).AddDays(-$days))
@@ -75,11 +61,13 @@ $accounts | ForEach-Object {
             erroraction    = 'stop'
         }
     
-        $retryCount = 0  # Create retry counter
+        $retryCount = 0  
+        $retrySleepMinutes = 2
+        $retryMax = 3
         while ($true) {
             try { [array]$results = Search-UnifiedAuditLog @LogSearchParams }
             catch { write-log -message "Unable to search audit data" }   
-            Start-Sleep -Seconds 10
+            Start-Sleep -Seconds 5
 
             # if results contains data... 
             if ( $results -ne $null -or $results.Count -ne 0 ) {   
@@ -88,6 +76,7 @@ $accounts | ForEach-Object {
                 Write-log -message "Audit Data found"    
                 continue 
             }
+
             # if no data found within results...
             if ($results -eq $null -or $results.Count -eq 0 ) {            
                 write-log -message "No data found begining sleep"     
@@ -102,8 +91,10 @@ $accounts | ForEach-Object {
                 }
                 else {
                     $retryCount ++ # Increment retry count
+                    $retrySleepMinutes = $retrySleepMinutes / 2
                 }
             }
+
             # max amount of retries exceeded stop searching...
             if ($retryCount -gt $retryMax -or $retryCount -eq $retryMax ) {   
                 write-log -message "Search complete"
@@ -115,9 +106,9 @@ $accounts | ForEach-Object {
         write-log -message "Converting and sorting data from json"
         $logArray = @()
         # Sort data and convert auditData from Json
-        $auditData | Sort-Object -Property UserIds | ForEach-Object{$_.auditdata} | ConvertFrom-Json | Select-Object -Property UserID,Operation,CreationTime,ClientIP `
-        |Where-Object Operation -eq 'UserLoggedIn'`
-        |ForEach-Object { 
+        $auditData | Sort-Object -Property UserIds | ForEach-Object{$_.auditdata} | ConvertFrom-Json `
+        | Select-Object -Property UserID,Operation,CreationTime,ClientIP `
+        | Where-Object Operation -eq 'UserLoggedIn' | ForEach-Object { 
             $userLog = [PSCustomObject]@{
                 Company = $companyName
                 User = $_.userID
@@ -125,18 +116,17 @@ $accounts | ForEach-Object {
                 CreationTime = $_.CreationTime
                 ClientIP = $_.ClientIP
             }
-
             $logArray += $userLog
         }
 
         write-log -message "convert and sort complete"
-        # add data for each company to a complete array
         $completeData += $logArray 
     }
+
     write-log -message "closing current company connection"
     Get-PSSession | Remove-PSSession 
 }
+
 write-log -message "All companies processed, exporting data"
 $completeData | Export-Csv -Path $dataPath
-
 Invoke-Command .\UpdateSql.ps1 -dataPath $dataPath
